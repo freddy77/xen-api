@@ -141,11 +141,29 @@ type syslog_stdout_t =
   | Syslog_DefaultKey
   | Syslog_WithKey of string
 
+let flag_syslog = 1
+let flag_syslog_stderr = 2
+
 (** Safe function which forks a command, closing all fds except a whitelist and
     having performed some fd operations in the child *)
 let safe_close_and_exec ?env stdin stdout stderr
     (fds : (string * Unix.file_descr) list) ?(syslog_stdout = NoSyslogging)
     ?(redirect_stderr_to_stdout = false) (cmd : string) (args : string list) =
+  let args = cmd :: args in
+  let env = Option.value ~default:default_path_env_pair env in
+  let syslog_key =
+    match syslog_stdout with
+    | Syslog_WithKey k ->
+        k
+    | _ ->
+        ""
+  in
+  let flags =
+    if syslog_stdout = NoSyslogging then 0 else flag_syslog
+  in
+  let flags =
+    flags lor if redirect_stderr_to_stdout then flag_syslog_stderr else 0
+  in
   let sock =
     Fecomms.open_unix_domain_sock_client (runtime_path ^ "/xapi/forker/main")
   in
@@ -156,8 +174,10 @@ let safe_close_and_exec ?env stdin stdout stderr
   let fds_to_close = ref [] in
 
   let add_fd_to_close_list fd = fds_to_close := fd :: !fds_to_close in
-  (* let remove_fd_from_close_list fd = fds_to_close := List.filter (fun fd' -> fd' <> fd) !fds_to_close in *)
+  let remove_fd_from_close_list fd = fds_to_close := List.filter (fun fd' -> fd' <> fd) !fds_to_close in
   let close_fds () = List.iter (fun fd -> Unix.close fd) !fds_to_close in
+
+  add_fd_to_close_list sock ;
 
   finally
     (fun () ->
@@ -184,7 +204,6 @@ let safe_close_and_exec ?env stdin stdout stderr
         List.fold_left maybe_add_id_to_fd_map dest_named_fds predefined_fds
       in
 
-      let env = Option.value ~default:default_path_env_pair env in
       let syslog_stdout =
         match syslog_stdout with
         | NoSyslogging ->
@@ -197,7 +216,7 @@ let safe_close_and_exec ?env stdin stdout stderr
       Fecomms.write_raw_rpc sock
         (Fe.Setup
            {
-             Fe.cmdargs= cmd :: args
+             Fe.cmdargs= args
            ; env= Array.to_list env
            ; id_to_fd_map
            ; syslog_stdout
@@ -246,6 +265,7 @@ let safe_close_and_exec ?env stdin stdout stderr
       Fecomms.write_raw_rpc sock Fe.Exec ;
       match Fecomms.read_raw_rpc sock with
       | Ok (Fe.Execed pid) ->
+          remove_fd_from_close_list sock ;
           (1, sock, pid)
       | Ok status ->
           let msg =
