@@ -31,6 +31,10 @@
 // XXX debug
 #define DEBUG 1
 
+typedef struct {
+    pid_t pid;
+} pidwaiter;
+
 static void pidwaiter_finalize(value v)
 {
   // TODO
@@ -49,7 +53,7 @@ static struct custom_operations custom_ops = {
 
 static value alloc_my_pidwaiter(void)
 {
-  value v = caml_alloc_custom(&custom_ops, sizeof(void*), 0, 1);
+  value v = caml_alloc_custom(&custom_ops, sizeof(pidwaiter), 0, 1);
   return v;
 }
 
@@ -148,9 +152,44 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
         unix_error(EACCES, "safe_exec", Nothing);
 #endif
 
+    unix_error(ENOSYS, "safe_exec", Nothing);
+
     res = caml_alloc_small(2, 0);
-    Field(res, 0) = Val_int(123); // TODO pid
-    Field(res, 1) = alloc_my_pidwaiter(); // TODO pidwaiter
+    Field(res, 0) = alloc_my_pidwaiter(); // TODO pidwaiter
+    Field(res, 1) = Val_int(123); // TODO pid
 
     CAMLreturn(res);
+}
+
+CAMLprim value
+caml_pidwaiter_dontwait(value waiter)
+{
+    CAMLparam1(waiter);
+
+    unix_error(ENOSYS, "xxx", Nothing);
+
+    CAMLreturn(Val_unit);
+}
+
+CAMLprim value
+caml_pidwaiter_waitpid(value timeout_, value waiter)
+{
+    CAMLparam2(timeout_, waiter);
+    double timeout = timeout_ == Val_none ? 0 : Double_val(Some_val(timeout_));
+
+    unix_error(ENOSYS, "xxx", Nothing);
+
+    // TODO type
+    CAMLreturn(Val_unit);
+}
+
+CAMLprim value
+caml_pidwaiter_waitpid_nohang(value waiter)
+{
+    CAMLparam1(waiter);
+
+    unix_error(ENOSYS, "xxx", Nothing);
+
+    // TODO type
+    CAMLreturn(Val_unit);
 }

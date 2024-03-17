@@ -36,12 +36,20 @@ let runtime_path = Option.value ~default:"/var" test_path
 
 let finally = Xapi_stdext_pervasives.Pervasiveext.finally
 
-type pidty = int * Unix.file_descr * int
+type waiter =
+  | Pidwaiter of Fe_stubs.pidwaiter
+  | Sock of Unix.file_descr ;;
+
+type pidty = waiter * int
 
 (* The forking executioner has been used, therefore we need to tell *it* to waitpid *)
 
-let string_of_pidty (_, fd, pid) =
-  Printf.sprintf "(FEFork (%d,%d))" (Fd_send_recv.int_of_fd fd) pid
+let string_of_pidty (waiter, pid) =
+  match waiter with
+  | Pidwaiter _ ->
+      Printf.sprintf "(FEFork (%d))" pid
+  | Sock fd ->
+      Printf.sprintf "(FEFork (%d,%d))" (Fd_send_recv.int_of_fd fd) pid
 
 exception Subprocess_failed of int
 
@@ -49,7 +57,7 @@ exception Subprocess_killed of int
 
 exception Subprocess_timeout
 
-let waitpid (_, sock, pid) =
+let waitpid_daemon sock pid =
   let status = Fecomms.read_raw_rpc sock in
   Unix.close sock ;
   match status with
@@ -72,16 +80,16 @@ let waitpid (_, sock, pid) =
       in
       failwith msg
 
-let waitpid_nohang ((_, sock, _) as x) =
+let waitpid_nohang_daemon sock pid =
   Unix.set_nonblock sock ;
   let r =
-    try waitpid x
+    try waitpid_daemon sock pid
     with Unix.(Unix_error ((EAGAIN | EWOULDBLOCK), _, _)) ->
       (0, Unix.WEXITED 0)
   in
   Unix.clear_nonblock sock ; r
 
-let dontwaitpid (_, sock, _pid) =
+let dontwaitpid_daemon sock _pid =
   ( try
       (* Try to tell the child fe that we're not going to wait for it. If the
          other end of the pipe has been closed then this doesn't matter, as this
@@ -90,6 +98,27 @@ let dontwaitpid (_, sock, _pid) =
     with Unix.Unix_error (Unix.EPIPE, _, _) -> ()
   ) ;
   Unix.close sock
+
+let waitpid (waiter, pid) =
+  match waiter with
+  | Pidwaiter waiter ->
+     Fe_stubs.pidwaiter_waitpid waiter
+  | Sock sock ->
+     waitpid_daemon sock pid
+
+let waitpid_nohang (waiter, pid) =
+  match waiter with
+  | Pidwaiter waiter ->
+     Fe_stubs.pidwaiter_waitpid_nohang waiter
+  | Sock sock ->
+     waitpid_nohang_daemon sock pid
+
+let dontwaitpid (waiter, pid) =
+  match waiter with
+  | Pidwaiter waiter ->
+     Fe_stubs.pidwaiter_dontwait waiter
+  | Sock sock ->
+     dontwaitpid_daemon sock pid
 
 let waitpid_fail_if_bad_exit ty =
   let _, status = waitpid ty in
@@ -103,7 +132,7 @@ let waitpid_fail_if_bad_exit ty =
   | Unix.WSTOPPED n ->
       raise (Subprocess_killed n)
 
-let getpid (_, _sock, pid) = pid
+let getpid (_waiter, pid) = pid
 
 type 'a result = Success of string * 'a | Failure of string * exn
 
@@ -143,10 +172,6 @@ type syslog_stdout_t =
 
 let flag_syslog = 1
 let flag_syslog_stderr = 2
-
-type pidwaiter
-
-external safe_exec : string list -> string array -> (string * Unix.file_descr * int) list -> int -> string option -> int * pidwaiter = "caml_safe_exec"
 
 let safe_close_and_exec_forkexec env stdin stdout stderr
     (fds : (string * Unix.file_descr) list) ?(syslog_stdout = NoSyslogging)
@@ -253,7 +278,7 @@ let safe_close_and_exec_forkexec env stdin stdout stderr
       match Fecomms.read_raw_rpc sock with
       | Ok (Fe.Execed pid) ->
           remove_fd_from_close_list sock ;
-          (1, sock, pid)
+          (Sock sock, pid)
       | Ok status ->
           let msg =
             Printf.sprintf
@@ -304,9 +329,12 @@ let safe_close_and_exec ?env stdin stdout stderr
   let mapping = add_fd mapping 0 stdin in
   let mapping = add_fd mapping 1 stdout in
   let mapping = add_fd mapping 2 stderr in
-  let (_pid, _waiter) = safe_exec args env mapping flags syslog_key in
-
-  safe_close_and_exec_forkexec env stdin stdout stderr fds ~syslog_stdout:syslog_stdout ~redirect_stderr_to_stdout:redirect_stderr_to_stdout args
+  try
+    let (waiter, pid) = Fe_stubs.safe_exec args env mapping flags syslog_key in
+    (Pidwaiter waiter, pid)
+  with _ ->
+    safe_close_and_exec_forkexec env stdin stdout stderr fds
+      ~syslog_stdout:syslog_stdout ~redirect_stderr_to_stdout:redirect_stderr_to_stdout args
 
 let execute_command_get_output_inner ?env ?stdin ?(syslog_stdout = NoSyslogging)
     ?(redirect_stderr_to_stdout = false) ?(timeout = -1.0) cmd args =
@@ -331,7 +359,7 @@ let execute_command_get_output_inner ?env ?stdin ?(syslog_stdout = NoSyslogging)
       match
         with_logfile_fd "execute_command_get_out" (fun out_fd ->
             with_logfile_fd "execute_command_get_err" (fun err_fd ->
-                let _, sock, pid =
+                let waiter, pid =
                   safe_close_and_exec ?env
                     (Option.map (fun (_, fd, _) -> fd) stdinandpipes)
                     (Some out_fd) (Some err_fd) [] ~syslog_stdout
@@ -343,13 +371,17 @@ let execute_command_get_output_inner ?env ?stdin ?(syslog_stdout = NoSyslogging)
                     close wr
                   )
                   stdinandpipes ;
-                if timeout > 0. then
-                  Unix.setsockopt_float sock Unix.SO_RCVTIMEO timeout ;
-                try waitpid (1, sock, pid)
-                with Unix.(Unix_error ((EAGAIN | EWOULDBLOCK), _, _)) ->
-                  Unix.kill pid Sys.sigkill ;
-                  ignore (waitpid (1, sock, pid)) ;
-                  raise Subprocess_timeout
+                match waiter with
+                | Pidwaiter waiter ->
+                  Fe_stubs.pidwaiter_waitpid ~timeout:timeout waiter
+                | Sock sock ->
+                  if timeout > 0. then
+                    Unix.setsockopt_float sock Unix.SO_RCVTIMEO timeout ;
+                  try waitpid_daemon sock pid
+                  with Unix.(Unix_error ((EAGAIN | EWOULDBLOCK), _, _)) ->
+                    Unix.kill pid Sys.sigkill ;
+                    ignore (waitpid_daemon sock pid) ;
+                    raise Subprocess_timeout
             )
         )
       with
