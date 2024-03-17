@@ -146,7 +146,7 @@ let flag_syslog_stderr = 2
 
 type pidwaiter
 
-external safe_exec : string list -> string array -> (string * int * int) list -> int -> string option -> int * pidwaiter = "caml_safe_exec"
+external safe_exec : string list -> string array -> (string * Unix.file_descr * int) list -> int -> string option -> int * pidwaiter = "caml_safe_exec"
 
 (** Safe function which forks a command, closing all fds except a whitelist and
     having performed some fd operations in the child *)
@@ -183,7 +183,18 @@ let safe_close_and_exec ?env stdin stdout stderr
 
   add_fd_to_close_list sock ;
 
-  ignore ( safe_exec args env [("uuid",1,2);("aaa",2,3)] flags syslog_key ) ;
+  let add_fd mapping_list uuid num fd=
+    match fd with
+    | Some fd ->
+        (uuid, fd, num) :: mapping_list
+    | _ ->
+        mapping_list
+  in
+  let mapping = List.map (fun (uuid, fd) -> (uuid, fd, -1)) fds in
+  let mapping = add_fd mapping stdinuuid 0 stdin in
+  let mapping = add_fd mapping stdoutuuid 1 stdout in
+  let mapping = add_fd mapping stderruuid 2 stderr in
+  ignore ( safe_exec args env mapping flags syslog_key ) ;
 
   finally
     (fun () ->
