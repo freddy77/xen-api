@@ -13,5 +13,9 @@
    xapi-stdext-pervasives
    xapi-stdext-unix
  )
+ (foreign_stubs
+  (language c)
+  (names fe_stubs)
+ )
  (preprocess
   (pps ppx_deriving_rpc)))

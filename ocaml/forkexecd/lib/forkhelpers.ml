@@ -144,6 +144,10 @@ type syslog_stdout_t =
 let flag_syslog = 1
 let flag_syslog_stderr = 2
 
+type pidwaiter
+
+external safe_exec : string list -> string list -> (string * int * int) list -> int -> string option -> int * pidwaiter = "caml_safe_exec"
+
 (** Safe function which forks a command, closing all fds except a whitelist and
     having performed some fd operations in the child *)
 let safe_close_and_exec ?env stdin stdout stderr
@@ -154,9 +158,9 @@ let safe_close_and_exec ?env stdin stdout stderr
   let syslog_key =
     match syslog_stdout with
     | Syslog_WithKey k ->
-        k
+        Some k
     | _ ->
-        ""
+        None
   in
   let flags =
     if syslog_stdout = NoSyslogging then 0 else flag_syslog
@@ -178,6 +182,8 @@ let safe_close_and_exec ?env stdin stdout stderr
   let close_fds () = List.iter (fun fd -> Unix.close fd) !fds_to_close in
 
   add_fd_to_close_list sock ;
+
+  ignore ( safe_exec args (Array.to_list env) [] flags syslog_key ) ;
 
   finally
     (fun () ->
