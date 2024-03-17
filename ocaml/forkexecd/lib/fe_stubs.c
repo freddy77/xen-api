@@ -56,19 +56,35 @@ static void print_list(value str_list)
 
 CAMLprim        value
 caml_safe_exec(value args, value environment, value id_mapping, value syslog_flags, value syslog_key)
-// val safe_exec : string list -> string list -> (string * int * int) list -> int -> string option -> int * pidwaiter
+// val safe_exec : string list -> string array -> (string * int * int) list -> int -> string option -> int * pidwaiter
 {
     value res;
     CAMLparam5(args, environment, id_mapping, syslog_flags, syslog_key);
 
     print_list(args);
-    print_list(environment);
 
+    mlsize_t num = caml_array_length(environment);
+    printf("environment is %p %zd [", environment, num);
+    for (mlsize_t n = 0; n < num; ++n) {
+        printf("\"%s\", ", String_val(Field(environment, n)));
+    }
+    printf("]\n");
+
+    printf("mapping is %p %p %p\n", id_mapping, Val_emptylist, Val_none);
+    while (id_mapping != Val_emptylist) {
+        value item = Field(id_mapping, 0);
+        printf("\"%s\", ", String_val(Field(item, 0)));
+        printf("%d, ", Int_val(Field(item, 1)));
+        printf("%d; ", Int_val(Field(item, 2)));
+        //printf("\"%s\", ", Field(str_list, 0));
+        id_mapping = Field(id_mapping, 1);
+    }
+    printf("]\n");
     // TODO mapping
 
     printf("flags %d\n", Int_val(syslog_flags));
 
-    printf("syslog_keyion is %s \"%s\"\n",
+    printf("syslog_key is %s \"%s\"\n",
            syslog_key == Val_none ? "None": "Some",
            syslog_key == Val_none ? "" : String_val(Some_val(syslog_key)));
 

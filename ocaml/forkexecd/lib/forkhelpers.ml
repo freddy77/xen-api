@@ -146,7 +146,7 @@ let flag_syslog_stderr = 2
 
 type pidwaiter
 
-external safe_exec : string list -> string list -> (string * int * int) list -> int -> string option -> int * pidwaiter = "caml_safe_exec"
+external safe_exec : string list -> string array -> (string * int * int) list -> int -> string option -> int * pidwaiter = "caml_safe_exec"
 
 (** Safe function which forks a command, closing all fds except a whitelist and
     having performed some fd operations in the child *)
@@ -183,7 +183,7 @@ let safe_close_and_exec ?env stdin stdout stderr
 
   add_fd_to_close_list sock ;
 
-  ignore ( safe_exec args (Array.to_list env) [] flags syslog_key ) ;
+  ignore ( safe_exec args env [("uuid",1,2);("aaa",2,3)] flags syslog_key ) ;
 
   finally
     (fun () ->
