@@ -36,11 +36,11 @@ let runtime_path = Option.value ~default:"/var" test_path
 
 let finally = Xapi_stdext_pervasives.Pervasiveext.finally
 
-type pidty = Unix.file_descr * int
+type pidty = int * Unix.file_descr * int
 
 (* The forking executioner has been used, therefore we need to tell *it* to waitpid *)
 
-let string_of_pidty (fd, pid) =
+let string_of_pidty (_, fd, pid) =
   Printf.sprintf "(FEFork (%d,%d))" (Fd_send_recv.int_of_fd fd) pid
 
 exception Subprocess_failed of int
@@ -49,7 +49,7 @@ exception Subprocess_killed of int
 
 exception Subprocess_timeout
 
-let waitpid (sock, pid) =
+let waitpid (_, sock, pid) =
   let status = Fecomms.read_raw_rpc sock in
   Unix.close sock ;
   match status with
@@ -72,7 +72,7 @@ let waitpid (sock, pid) =
       in
       failwith msg
 
-let waitpid_nohang ((sock, _) as x) =
+let waitpid_nohang ((_, sock, _) as x) =
   Unix.set_nonblock sock ;
   let r =
     try waitpid x
@@ -81,7 +81,7 @@ let waitpid_nohang ((sock, _) as x) =
   in
   Unix.clear_nonblock sock ; r
 
-let dontwaitpid (sock, _pid) =
+let dontwaitpid (_, sock, _pid) =
   ( try
       (* Try to tell the child fe that we're not going to wait for it. If the
          other end of the pipe has been closed then this doesn't matter, as this
@@ -103,7 +103,7 @@ let waitpid_fail_if_bad_exit ty =
   | Unix.WSTOPPED n ->
       raise (Subprocess_killed n)
 
-let getpid (_sock, pid) = pid
+let getpid (_, _sock, pid) = pid
 
 type 'a result = Success of string * 'a | Failure of string * exn
 
@@ -246,7 +246,7 @@ let safe_close_and_exec ?env stdin stdout stderr
       Fecomms.write_raw_rpc sock Fe.Exec ;
       match Fecomms.read_raw_rpc sock with
       | Ok (Fe.Execed pid) ->
-          (sock, pid)
+          (1, sock, pid)
       | Ok status ->
           let msg =
             Printf.sprintf
@@ -288,7 +288,7 @@ let execute_command_get_output_inner ?env ?stdin ?(syslog_stdout = NoSyslogging)
       match
         with_logfile_fd "execute_command_get_out" (fun out_fd ->
             with_logfile_fd "execute_command_get_err" (fun err_fd ->
-                let sock, pid =
+                let _, sock, pid =
                   safe_close_and_exec ?env
                     (Option.map (fun (_, fd, _) -> fd) stdinandpipes)
                     (Some out_fd) (Some err_fd) [] ~syslog_stdout
@@ -302,10 +302,10 @@ let execute_command_get_output_inner ?env ?stdin ?(syslog_stdout = NoSyslogging)
                   stdinandpipes ;
                 if timeout > 0. then
                   Unix.setsockopt_float sock Unix.SO_RCVTIMEO timeout ;
-                try waitpid (sock, pid)
+                try waitpid (1, sock, pid)
                 with Unix.(Unix_error ((EAGAIN | EWOULDBLOCK), _, _)) ->
                   Unix.kill pid Sys.sigkill ;
-                  ignore (waitpid (sock, pid)) ;
+                  ignore (waitpid (1, sock, pid)) ;
                   raise Subprocess_timeout
             )
         )
