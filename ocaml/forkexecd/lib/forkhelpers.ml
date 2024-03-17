@@ -148,26 +148,9 @@ type pidwaiter
 
 external safe_exec : string list -> string array -> (string * Unix.file_descr * int) list -> int -> string option -> int * pidwaiter = "caml_safe_exec"
 
-(** Safe function which forks a command, closing all fds except a whitelist and
-    having performed some fd operations in the child *)
-let safe_close_and_exec ?env stdin stdout stderr
+let safe_close_and_exec_forkexec env stdin stdout stderr
     (fds : (string * Unix.file_descr) list) ?(syslog_stdout = NoSyslogging)
-    ?(redirect_stderr_to_stdout = false) (cmd : string) (args : string list) =
-  let args = cmd :: args in
-  let env = Option.value ~default:default_path_env_pair env in
-  let syslog_key =
-    match syslog_stdout with
-    | Syslog_WithKey k ->
-        Some k
-    | _ ->
-        None
-  in
-  let flags =
-    if syslog_stdout = NoSyslogging then 0 else flag_syslog
-  in
-  let flags =
-    flags lor if redirect_stderr_to_stdout then flag_syslog_stderr else 0
-  in
+    ?(redirect_stderr_to_stdout = false) (args : string list) =
   let sock =
     Fecomms.open_unix_domain_sock_client (runtime_path ^ "/xapi/forker/main")
   in
@@ -182,19 +165,6 @@ let safe_close_and_exec ?env stdin stdout stderr
   let close_fds () = List.iter (fun fd -> Unix.close fd) !fds_to_close in
 
   add_fd_to_close_list sock ;
-
-  let add_fd mapping_list uuid num fd=
-    match fd with
-    | Some fd ->
-        (uuid, fd, num) :: mapping_list
-    | _ ->
-        mapping_list
-  in
-  let mapping = List.map (fun (uuid, fd) -> (uuid, fd, -1)) fds in
-  let mapping = add_fd mapping stdinuuid 0 stdin in
-  let mapping = add_fd mapping stdoutuuid 1 stdout in
-  let mapping = add_fd mapping stderruuid 2 stderr in
-  ignore ( safe_exec args env mapping flags syslog_key ) ;
 
   finally
     (fun () ->
@@ -301,6 +271,42 @@ let safe_close_and_exec ?env stdin stdout stderr
           failwith msg
     )
     close_fds
+
+(** Safe function which forks a command, closing all fds except a whitelist and
+    having performed some fd operations in the child *)
+let safe_close_and_exec ?env stdin stdout stderr
+    (fds : (string * Unix.file_descr) list) ?(syslog_stdout = NoSyslogging)
+    ?(redirect_stderr_to_stdout = false) (cmd : string) (args : string list) =
+  let args = cmd :: args in
+  let env = Option.value ~default:default_path_env_pair env in
+  let syslog_key =
+    match syslog_stdout with
+    | Syslog_WithKey k ->
+        Some k
+    | _ ->
+        None
+  in
+  let flags =
+    if syslog_stdout = NoSyslogging then 0 else flag_syslog
+  in
+  let flags =
+    flags lor if redirect_stderr_to_stdout then flag_syslog_stderr else 0
+  in
+
+  let add_fd mapping_list num fd=
+    match fd with
+    | Some fd ->
+        (Uuidx.(to_string (make ())), fd, num) :: mapping_list
+    | _ ->
+        mapping_list
+  in
+  let mapping = List.map (fun (uuid, fd) -> (uuid, fd, -1)) fds in
+  let mapping = add_fd mapping 0 stdin in
+  let mapping = add_fd mapping 1 stdout in
+  let mapping = add_fd mapping 2 stderr in
+  let (_pid, _waiter) = safe_exec args env mapping flags syslog_key in
+
+  safe_close_and_exec_forkexec env stdin stdout stderr fds ~syslog_stdout:syslog_stdout ~redirect_stderr_to_stdout:redirect_stderr_to_stdout args
 
 let execute_command_get_output_inner ?env ?stdin ?(syslog_stdout = NoSyslogging)
     ?(redirect_stderr_to_stdout = false) ?(timeout = -1.0) cmd args =
