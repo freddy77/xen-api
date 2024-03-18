@@ -217,38 +217,41 @@ caml_pidwaiter_waitpid(value timeout_, value pid_)
     double timeout = timeout_ == Val_none ? 0 : Double_val(Some_val(timeout_));
     pid_t const pid = Int_val(pid_);
 
-    // TODO handle errors
-    timeout_kill tm = { pid, false };
-    clock_gettime(CLOCK_MONOTONIC, &tm.ts);
-
+    siginfo_t info;
+    bool timed_out = false;
     if (timeout > 0) {
-        // TODO if no timeout just use a wait !!
+        // TODO handle errors
+        timeout_kill tm = { pid, false };
+        clock_gettime(CLOCK_MONOTONIC, &tm.ts);
+
         double f = floor(timeout);
         tm.ts.tv_sec += f;
         tm.ts.tv_nsec += (timeout - f) * 1000000000.;
+
+        pthread_condattr_t attr;
+        pthread_condattr_init(&attr);
+        pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+
+        pthread_cond_init(&tm.cond, &attr);
+        pthread_condattr_destroy(&attr);
+
+        pthread_mutex_init(&tm.mtx, NULL);
+
+        pthread_t th;
+        pthread_create(&th, NULL, proc_timeout_kill, &tm);
+        waitid(P_PID, pid, &info, WEXITED|WNOWAIT);
+        pthread_mutex_lock(&tm.mtx);
+        pthread_cond_broadcast(&tm.cond);
+        pthread_mutex_unlock(&tm.mtx);
+        pthread_join(th, NULL);
+        pthread_cond_destroy(&tm.cond);
+        pthread_mutex_destroy(&tm.mtx);
+        timed_out = tm.timed_out;
+    } else {
+        waitid(P_PID, pid, &info, WEXITED|WNOWAIT);
     }
 
-    pthread_condattr_t attr;
-    pthread_condattr_init(&attr);
-    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-
-    pthread_cond_init(&tm.cond, &attr);
-    pthread_condattr_destroy(&attr);
-
-    pthread_mutex_init(&tm.mtx, NULL);
-
-    pthread_t th;
-    pthread_create(&th, NULL, proc_timeout_kill, &tm);
-    siginfo_t info;
-    waitid(P_PID, pid, &info, WEXITED|WNOWAIT);
-    pthread_mutex_lock(&tm.mtx);
-    pthread_cond_broadcast(&tm.cond);
-    pthread_mutex_unlock(&tm.mtx);
-    pthread_join(th, NULL);
-    pthread_cond_destroy(&tm.cond);
-    pthread_mutex_destroy(&tm.mtx);
-
-    CAMLreturn(tm.timed_out ? Val_true : Val_false);
+    CAMLreturn(timed_out ? Val_true : Val_false);
 }
 
 CAMLprim value
