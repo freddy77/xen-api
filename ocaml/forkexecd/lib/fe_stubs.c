@@ -41,7 +41,11 @@
 
 typedef struct {
     pid_t pid;
+    bool reaped;
 } pidwaiter;
+
+#define PIDWAITER(name, value) \
+    pidwaiter *const name = ((pidwaiter*) Data_custom_val(value))
 
 static void pidwaiter_finalize(value v)
 {
@@ -59,10 +63,13 @@ static struct custom_operations custom_ops = {
   custom_fixed_length_default
 };
 
-static value alloc_my_pidwaiter(void)
+static value alloc_my_pidwaiter(pid_t pid)
 {
-  value v = caml_alloc_custom(&custom_ops, sizeof(pidwaiter), 0, 1);
-  return v;
+    value v = caml_alloc_custom(&custom_ops, sizeof(pidwaiter), 0, 1);
+    PIDWAITER(waiter, v);
+    waiter->pid = pid;
+    waiter->reaped = false;
+    return v;
 }
 
 typedef struct {
@@ -219,6 +226,9 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
 
         close_unwanted(info->mappings, num_mappings);
 
+        if (setsid() < 0)
+            _exit(1);
+
         // redirect file descriptors
         sort_mapping(info->mappings, num_mappings, compare_wanted);
         int last_free = 3;
@@ -252,8 +262,8 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
         for (int i = 0; i < 3; ++i)
             close(i);
         open("/dev/null", O_WRONLY);
-        for (int i = 1; i < 3; ++i)
-            dup2(0, i);
+        dup2(0, 1);
+        dup2(0, 2);
 
         for (unsigned i = 0; i < num_mappings; ++i) {
             mapping *m = &info->mappings[i];
@@ -274,7 +284,7 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
     caml_leave_blocking_section();
 
     res = caml_alloc_small(2, 0);
-    Field(res, 0) = alloc_my_pidwaiter(); // TODO pidwaiter
+    Field(res, 0) = alloc_my_pidwaiter(pid);
     Field(res, 1) = Val_int(pid);
 
     CAMLreturn(res);
@@ -335,11 +345,15 @@ static void close_unwanted(mapping *const mappings, unsigned num_mappings)
 }
 
 CAMLprim value
-caml_pidwaiter_dontwait(value waiter)
+caml_pidwaiter_dontwait(value waiter_val)
 {
-    CAMLparam1(waiter);
+    CAMLparam1(waiter_val);
+    PIDWAITER(waiter, waiter_val);
 
-    unix_error(ENOSYS, "xxx", Nothing);
+    if (!waiter->reaped) {
+        // TODO we need to wait the pid
+        unix_error(ENOSYS, "xxx", Nothing);
+    }
 
     CAMLreturn(Val_unit);
 }
@@ -364,6 +378,33 @@ static void *proc_timeout_kill(void *arg)
         kill(tm->pid, SIGKILL);
         tm->timed_out = true;
     }
+    return NULL;
+}
+
+static int
+create_thread_minstack(pthread_t *th, void *(*proc)(void *), void *arg)
+{
+    int res;
+
+    // disable any possible signal handler so we can safely use a small stack
+    // for the thread
+    sigset_t sigset, old_sigset;
+    sigfillset(&sigset);
+    sigprocmask(SIG_SETMASK, &sigset, &old_sigset);
+
+    pthread_attr_t th_attr;
+    res = pthread_attr_init(&th_attr);
+    if (res)
+        return res;
+    pthread_attr_setstacksize(&th_attr, PTHREAD_STACK_MIN);
+
+    // Create timeout thread
+    res = pthread_create(th, &th_attr, proc, arg);
+
+    pthread_attr_destroy(&th_attr);
+    sigprocmask(SIG_SETMASK, &old_sigset, NULL);
+
+    return res;
 }
 
 /*
@@ -395,9 +436,8 @@ static bool wait_process_timeout(pid_t pid, double timeout)
     pthread_mutex_init(&tm.mtx, NULL);
 
     // Create timeout thread
-    // TODO reduce stack size, disable signals
     pthread_t th;
-    pthread_create(&th, NULL, proc_timeout_kill, &tm);
+    create_thread_minstack(&th, proc_timeout_kill, &tm);
 
     // Wait the process, we avoid to reap the other process to avoid
     // race conditions. Consider:
@@ -424,11 +464,12 @@ static bool wait_process_timeout(pid_t pid, double timeout)
 }
 
 CAMLprim value
-caml_pidwaiter_waitpid(value timeout_, value pid_)
+caml_pidwaiter_waitpid(value timeout_value, value waiter_value)
 {
-    CAMLparam2(timeout_, pid_);
-    double timeout = timeout_ == Val_none ? 0 : Double_val(Some_val(timeout_));
-    pid_t const pid = Int_val(pid_);
+    CAMLparam2(timeout_value, waiter_value);
+    PIDWAITER(waiter, waiter_value);
+    double timeout = timeout_value == Val_none ? 0 : Double_val(Some_val(timeout_value));
+    pid_t const pid = waiter->pid;
 
     caml_enter_blocking_section();
 
@@ -444,6 +485,27 @@ caml_pidwaiter_waitpid(value timeout_, value pid_)
 
     CAMLreturn(timed_out ? Val_true : Val_false);
 }
+
+CAMLprim value
+caml_pidwaiter_pid(value waiter_value)
+{
+    CAMLparam1(waiter_value);
+    PIDWAITER(waiter, waiter_value);
+
+    CAMLreturn(Val_int(waiter->pid));
+}
+
+CAMLprim value
+caml_pidwaiter_set_reap(value waiter_value)
+{
+    CAMLparam1(waiter_value);
+    PIDWAITER(waiter, waiter_value);
+
+    waiter->reaped = true;
+
+    CAMLreturn(Val_unit);
+}
+
 
 /*
  * waiter : proc thread with small thread

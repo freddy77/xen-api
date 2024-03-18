@@ -19,25 +19,34 @@ external safe_exec : string list -> string array -> (string * Unix.file_descr * 
 external pidwaiter_dontwait : pidwaiter -> unit = "caml_pidwaiter_dontwait"
 
 (* timeout <= 0 wait infinite *)
-external pidwaiter_waitpid0 : ?timeout:float -> int -> bool = "caml_pidwaiter_waitpid"
+external _pidwaiter_waitpid_timeout : ?timeout:float -> pidwaiter -> bool = "caml_pidwaiter_waitpid"
 
-let pidwaiter_waitpid ?timeout _waiter pid = (* -> int * Unix.process_status = *)
-   match timeout with
-   | Some timeout ->
-       let timed_out = pidwaiter_waitpid0 ~timeout:timeout pid in
-       (* TODO timeout *)
-       let (pid, status) = Unix.waitpid [] pid in
-       (match timed_out, status with
-       | true, Unix.WSIGNALED n when n = Sys.sigkill ->
-           raise (Unix.Unix_error(Unix.ETIMEDOUT, "waitpid", ""))
-       | _ ->
-          (pid, status)
-       )
-   | None ->
-       (* TODO set reap *)
-       Unix.waitpid [] pid
+external _pidwaiter_set_reap: pidwaiter -> unit = "caml_pidwaiter_set_reap"
 
-let pidwaiter_waitpid_nohang _waiter pid =
-   (* TODO set reap *)
-   Unix.waitpid [WNOHANG] pid
+(* get the pid of the waiter *)
+external _pidwaiter_pid: pidwaiter -> int = "caml_pidwaiter_pid"
 
+let _pidwaiter_waitpid flags waiter =
+   let waiter_pid = _pidwaiter_pid waiter in
+   let (pid, status) = Unix.waitpid flags waiter_pid in
+   (* we can't reap the process twice, otherwise we could reap another process *)
+   if pid = waiter_pid then _pidwaiter_set_reap waiter ;
+   (pid, status)
+
+let pidwaiter_waitpid ?timeout waiter =
+   let timed_out =
+      match timeout with
+      | Some timeout ->
+          _pidwaiter_waitpid_timeout ~timeout:timeout waiter
+      | None ->
+          false
+   in
+   let (pid, status) = _pidwaiter_waitpid [] waiter in
+   match timed_out, status with
+   | true, Unix.WSIGNALED n when n = Sys.sigkill ->
+       raise (Unix.Unix_error(Unix.ETIMEDOUT, "waitpid", ""))
+   | _ ->
+      (pid, status)
+
+let pidwaiter_waitpid_nohang waiter =
+   _pidwaiter_waitpid [WNOHANG] waiter
