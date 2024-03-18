@@ -17,7 +17,10 @@
 #include <stdbool.h>
 #include <math.h>
 #include <pthread.h>
+#include <fcntl.h>
 #include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 #include <caml/alloc.h>
 #include <caml/mlvalues.h>
@@ -26,6 +29,7 @@
 #include <caml/memory.h>
 #include <caml/custom.h>
 #include <caml/unixsupport.h>
+#include <caml/signals.h>
 
 #undef DEBUG
 
@@ -62,8 +66,15 @@ static value alloc_my_pidwaiter(void)
 }
 
 typedef struct {
+    const char *uuid;
+    int current_fd;
+    int wanted_fd;
+} mapping;
+
+typedef struct {
     char **args;
     char **environment;
+    mapping *mappings;
     int syslog_flags;
     const char *syslog_key;
 } exec_info;
@@ -76,6 +87,17 @@ static char *append_string(char **p_dest, const char *s)
     *p_dest = dest + size;
     return dest;
 }
+
+static inline void sort_mapping(mapping *const mappings, unsigned num_mappings, int (*compare)(const mapping *a, const mapping *b))
+{
+    qsort(mappings, num_mappings, sizeof(*mappings), (int (*)(const void *a, const void *b)) compare);
+}
+
+static void adjust_args(char **args, mapping *const mappings, unsigned num_mappings);
+static bool fd_is_used(const mapping *const mappings, unsigned num_mappings, int fd);
+static void close_unwanted(mapping *const mappings, unsigned num_mappings);
+static int compare_current(const mapping *a, const mapping *b);
+static int compare_wanted(const mapping *a, const mapping *b);
 
 CAMLprim value
 caml_safe_exec(value args, value environment, value id_mapping, value syslog_flags, value syslog_key)
@@ -118,13 +140,16 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
     size_t total_size =
         sizeof(exec_info) +
         sizeof(char*) * (num_args + 1 + num_environment + 1) +
+        sizeof(mapping) * num_mappings +
         strings_size;
     exec_info *info = (exec_info *) calloc(total_size, 1);
     if (!info)
         unix_error(ENOMEM, "safe_exec", Nothing);
     char **ptrs = (char**)(info + 1);
-    char *strings = (char*)(ptrs + num_args + 1 + num_environment + 1);
+    mapping *mappings = (mapping *) (ptrs + num_args + 1 + num_environment + 1);
+    char *strings = (char*) (mappings + num_mappings);
 #ifdef DEBUG
+    mapping *const initial_mappings = mappings;
     char *const initial_strings = strings;
 #endif
 
@@ -149,8 +174,20 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
     }
     *ptrs++ = NULL;
 
+    // copy mappings
+    info->mappings = mappings;
+    FOREACH_LIST(map, id_mapping) {
+        mapping *m = mappings++;
+        value item = Field(map, 0);
+        m->uuid = String_val(Field(item, 0));
+        m->current_fd = Int_val(Field(item, 1));
+        m->wanted_fd = Int_val(Field(item, 2));
+    }
+
 #ifdef DEBUG
-    if (strings - (char*)info != total_size || initial_strings != (char*) ptrs)
+    if (strings - (char*)info != total_size
+        || initial_mappings != (mapping*) ptrs
+        || initial_strings != (char*) mappings)
         unix_error(EACCES, "safe_exec", Nothing);
 #endif
 
@@ -166,9 +203,66 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
 
     if (pid == 0) {
         // child
-        // TODO adjust file descriptors
+
+#if 0
+        for (unsigned i = 0; i < num_mappings; ++i) {
+            const mapping *m = &info->mappings[i];
+            printf("mapping %s %d %d\n", m->uuid, m->current_fd, m->wanted_fd);
+        }
+        printf("\n");
+#endif
+
+        close_unwanted(info->mappings, num_mappings);
+
+        // redirect file descriptors
+        sort_mapping(info->mappings, num_mappings, compare_wanted);
+        int last_free = 3;
+        for (unsigned i = 0; i < num_mappings; ++i) {
+            mapping *m = &info->mappings[i];
+            // find fd to use
+            while (fd_is_used(info->mappings, num_mappings, last_free))
+                ++last_free;
+            // duplicate on new one
+            int old_fd = m->current_fd;
+            dup2(old_fd, last_free);
+            m->current_fd = -1;
+            if (!fd_is_used(info->mappings, num_mappings, old_fd))
+                close(old_fd);
+            m->current_fd = last_free;
+            if (m->wanted_fd < 0)
+               m->wanted_fd = last_free;
+        }
+
+#if 0
+        FILE *f = fopen("out", "a");
+        for (unsigned i = 0; i < num_mappings; ++i) {
+            const mapping *m = &info->mappings[i];
+            fprintf(f, "mapping %s %d %d\n", m->uuid, m->current_fd, m->wanted_fd);
+        }
+        fprintf(f, "\n");
+        fclose(f);
+#endif
+
+        // TODO always needed??
+        for (int i = 0; i < 3; ++i)
+            close(i);
+        open("/dev/null", O_WRONLY);
+        for (int i = 1; i < 3; ++i)
+            dup2(0, i);
+
+        for (unsigned i = 0; i < num_mappings; ++i) {
+            mapping *m = &info->mappings[i];
+            if (m->wanted_fd <= 2) {
+                dup2(m->current_fd, m->wanted_fd);
+                close(m->current_fd);
+                m->current_fd = m->wanted_fd;
+            }
+        }
+
+        adjust_args(info->args, info->mappings, num_mappings);
+
         execve(info->args[0], info->args, info->environment);
-        exit(errno == ENOENT ? 127 : 126);
+        _exit(errno == ENOENT ? 127 : 126);
     }
     free(info);
 
@@ -177,6 +271,60 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
     Field(res, 1) = Val_int(pid);
 
     CAMLreturn(res);
+}
+
+static void adjust_args(char **args, mapping *const mappings, unsigned num_mappings)
+{
+    for (size_t n = 0; args[n]; ++n) {
+        char *arg = args[n];
+        size_t len = strlen(arg);
+        if (len < 36)
+            continue;
+
+        // replace uuid with file descriptor
+        char *uuid = arg + len - 36;
+        for (unsigned i = 0; i < num_mappings; ++i) {
+            const mapping *m = &mappings[i];
+            if (strcmp(m->uuid, uuid) != 0)
+                continue;
+            //sprintf(uuid, "%d", m->wanted_fd >= 0 ? m->wanted_fd : m->current_fd);
+            sprintf(uuid, "%d", m->current_fd);
+        }
+    }
+}
+
+static bool fd_is_used(const mapping *const mappings, unsigned num_mappings, int fd)
+{
+    for (unsigned i = 0; i < num_mappings; ++i) {
+        const mapping *m = &mappings[i];
+        if (m->current_fd == fd)
+            return true;
+    }
+    return false;
+}
+
+static int compare_current(const mapping *a, const mapping *b)
+{
+    return a->current_fd - b->current_fd;
+}
+
+static int compare_wanted(const mapping *a, const mapping *b)
+{
+    return a->wanted_fd - b->wanted_fd;
+}
+
+static void close_unwanted(mapping *const mappings, unsigned num_mappings)
+{
+    sort_mapping(mappings, num_mappings, compare_current);
+
+    int prev = -1;
+    for (unsigned i = 0; i < num_mappings; ++i) {
+        const mapping *m = &mappings[i];
+        for (int fd = prev + 1; fd < m->current_fd; ++fd)
+            close(fd);
+        prev = m->current_fd;
+    }
+    // TODO close from prev+1 on the top!
 }
 
 CAMLprim value
@@ -200,6 +348,7 @@ typedef struct {
 static void *proc_timeout_kill(void *arg)
 {
     timeout_kill *tm = (timeout_kill *) arg;
+
     pthread_mutex_lock(&tm->mtx);
     int res  = pthread_cond_timedwait(&tm->cond, &tm->mtx, &tm->ts);
     pthread_mutex_unlock(&tm->mtx);
@@ -210,6 +359,63 @@ static void *proc_timeout_kill(void *arg)
     }
 }
 
+/*
+ * Wait a process with a given timeout.
+ * At the end of timeout (if trigger) kill the process.
+ * To avoid race we need to wait a specific process, but this is blocking
+ * and we use a timeout to implement the wait. Timer functions are per
+ * process, not per thread.
+ */
+static bool wait_process_timeout(pid_t pid, double timeout)
+{
+    // TODO handle errors
+
+    // compute deadline
+    timeout_kill tm = { pid, false };
+    clock_gettime(CLOCK_MONOTONIC, &tm.ts);
+
+    double f = floor(timeout);
+    tm.ts.tv_sec += f;
+    tm.ts.tv_nsec += (timeout - f) * 1000000000.;
+
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+
+    pthread_cond_init(&tm.cond, &attr);
+    pthread_condattr_destroy(&attr);
+
+    pthread_mutex_init(&tm.mtx, NULL);
+
+    // Create timeout thread
+    // TODO reduce stack size, disable signals
+    pthread_t th;
+    pthread_create(&th, NULL, proc_timeout_kill, &tm);
+
+    // Wait the process, we avoid to reap the other process to avoid
+    // race conditions. Consider:
+    // - process exit;
+    // - we reap the thread;
+    // - OS reuse the pid;
+    // - timeout thread terminate the pid, now reused.
+    // Avoiding reaping the process will create a zombie process so
+    // the KILL would be directed to that.
+    siginfo_t info;
+    waitid(P_PID, pid, &info, WEXITED|WNOWAIT);
+
+    // Close the timeout thread
+    pthread_mutex_lock(&tm.mtx);
+    pthread_cond_broadcast(&tm.cond);
+    pthread_mutex_unlock(&tm.mtx);
+    pthread_join(th, NULL);
+
+    // Cleanup
+    pthread_cond_destroy(&tm.cond);
+    pthread_mutex_destroy(&tm.mtx);
+
+    return tm.timed_out;
+}
+
 CAMLprim value
 caml_pidwaiter_waitpid(value timeout_, value pid_)
 {
@@ -217,39 +423,17 @@ caml_pidwaiter_waitpid(value timeout_, value pid_)
     double timeout = timeout_ == Val_none ? 0 : Double_val(Some_val(timeout_));
     pid_t const pid = Int_val(pid_);
 
-    siginfo_t info;
+    caml_enter_blocking_section();
+
     bool timed_out = false;
     if (timeout > 0) {
-        // TODO handle errors
-        timeout_kill tm = { pid, false };
-        clock_gettime(CLOCK_MONOTONIC, &tm.ts);
-
-        double f = floor(timeout);
-        tm.ts.tv_sec += f;
-        tm.ts.tv_nsec += (timeout - f) * 1000000000.;
-
-        pthread_condattr_t attr;
-        pthread_condattr_init(&attr);
-        pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-
-        pthread_cond_init(&tm.cond, &attr);
-        pthread_condattr_destroy(&attr);
-
-        pthread_mutex_init(&tm.mtx, NULL);
-
-        pthread_t th;
-        pthread_create(&th, NULL, proc_timeout_kill, &tm);
-        waitid(P_PID, pid, &info, WEXITED|WNOWAIT);
-        pthread_mutex_lock(&tm.mtx);
-        pthread_cond_broadcast(&tm.cond);
-        pthread_mutex_unlock(&tm.mtx);
-        pthread_join(th, NULL);
-        pthread_cond_destroy(&tm.cond);
-        pthread_mutex_destroy(&tm.mtx);
-        timed_out = tm.timed_out;
+        timed_out = wait_process_timeout(pid, timeout);
     } else {
+        siginfo_t info;
         waitid(P_PID, pid, &info, WEXITED|WNOWAIT);
     }
+
+    caml_leave_blocking_section();
 
     CAMLreturn(timed_out ? Val_true : Val_false);
 }
@@ -262,3 +446,5 @@ caml_pidwaiter_waitpid(value timeout_, value pid_)
  *    waitpid (pid)
  *
  */
+
+// vim: expandtab ts=4 sw=4 sts=4:
