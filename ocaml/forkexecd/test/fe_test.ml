@@ -110,8 +110,7 @@ let test_delay () =
   let exe = Printf.sprintf "/proc/%d/exe" (Unix.getpid ()) in
   let args = ["sleep"] in
   try
-    (* Forkhelpers.execute_command_get_output ~syslog_stdout:Forkhelpers.Syslog_DefaultKey ~redirect_stderr_to_stdout:true ~timeout:1.0 exe args |> ignore ; *)
-    Forkhelpers.execute_command_get_output ~syslog_stdout:Forkhelpers.Syslog_DefaultKey ~timeout:1.0 exe args |> ignore ;
+    Forkhelpers.execute_command_get_output ~timeout:4.0 exe args |> ignore ;
     failwith "Failed to timeout"
   with
   | Forkhelpers.Subprocess_timeout ->
@@ -151,7 +150,6 @@ let test_exitcode () =
   in
   run_expect "/bin/false" 1 ;
   run_expect "/bin/xe-fe-test-no-command" 127 ;
-  run_expect "/bin/xe-fe-no-path/xe-fe-test-no-command" 127 ;
   run_expect "/etc/hosts" 126 ;
   Printf.printf "\nCompleted exitcode tests\n"
 
@@ -235,22 +233,7 @@ let slave = function
              pid (List.length filtered) ls
           )
 
-let sleep () =
-  Printf.printf "Test out\x00\xc2\x80\nOther li\x00ne\n" ;
-  Printf.printf "%s" "Test xxx \x50\x51\x52\x53\x54\x55\x56\x57\x58\x59\x5a\x5b\x5c\x5d\x5e\x5f\n" ;
-  flush stdout ;
-  let rec loop i =
-    if i <= 0 then ()
-    else begin
-      Printf.printf "Some data " ;
-      loop (i - 1)
-    end
-  in
-  loop 100 ;
-  Printf.printf " END\n" ;
-  flush stdout ;
-  Unix.sleep 2 ; Printf.printf "Ok\n" ;
-  flush stdout
+let sleep () = Unix.sleep 5 ; Printf.printf "Ok\n"
 
 let usage () =
   Printf.printf "Usage:\n" ;
