@@ -18,9 +18,14 @@
 #include <math.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 #include <caml/alloc.h>
 #include <caml/mlvalues.h>
@@ -39,6 +44,8 @@
 // XXX debug
 #define DEBUG 1
 
+static int create_thread_minstack(pthread_t *th, void *(*proc)(void *), void *arg);
+
 typedef struct {
     pid_t pid;
     bool reaped;
@@ -47,20 +54,37 @@ typedef struct {
 #define PIDWAITER(name, value) \
     pidwaiter *const name = ((pidwaiter*) Data_custom_val(value))
 
+static void *proc_reap(void *arg)
+{
+    pid_t pid = (pid_t) (intptr_t) arg;
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    return NULL;
+}
+
 static void pidwaiter_finalize(value v)
 {
-  // TODO reap the pid to avoid zombies
+    PIDWAITER(waiter, v);
+
+    // reap the pid to avoid zombies
+    if (!waiter->reaped) {
+        pthread_t th;
+        create_thread_minstack(&th, proc_reap, (void *) (intptr_t) waiter->pid);
+        pthread_detach(th);
+    }
 }
 
 static struct custom_operations custom_ops = {
-  "com.xenserver.pidwaiter",
-  pidwaiter_finalize,
-  custom_compare_default,
-  custom_hash_default,
-  custom_serialize_default,
-  custom_deserialize_default,
-  custom_compare_ext_default,
-  custom_fixed_length_default
+    "com.xenserver.pidwaiter",
+    pidwaiter_finalize,
+    custom_compare_default,
+    custom_hash_default,
+    custom_serialize_default,
+    custom_deserialize_default,
+    custom_compare_ext_default,
+    custom_fixed_length_default
 };
 
 static value alloc_my_pidwaiter(pid_t pid)
@@ -95,9 +119,11 @@ static char *append_string(char **p_dest, const char *s)
     return dest;
 }
 
-static inline void sort_mapping(mapping *const mappings, unsigned num_mappings, int (*compare)(const mapping *a, const mapping *b))
+static inline void sort_mapping(mapping *const mappings, unsigned num_mappings,
+                                int (*compare)(const mapping *a, const mapping *b))
 {
-    qsort(mappings, num_mappings, sizeof(*mappings), (int (*)(const void *a, const void *b)) compare);
+    qsort(mappings, num_mappings, sizeof(*mappings),
+          (int (*)(const void *a, const void *b)) compare);
 }
 
 static void adjust_args(char **args, mapping *const mappings, unsigned num_mappings);
@@ -117,6 +143,7 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
     const int flags = Int_val(syslog_flags);
     const char *const key = (syslog_key == Val_none) ? NULL : String_val(Some_val(syslog_key));
     CAMLparam5(args, environment, id_mapping, syslog_flags, syslog_key);
+    CAMLlocal1(waiter);
 
     FOREACH_LIST(arg, args) {
         strings_size += strlen(String_val(Field(arg, 0))) + 1;
@@ -207,7 +234,7 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
 
     // rename all command line
     // fork
-    pid_t pid = fork();
+    pid_t pid = vfork();
     if (pid < 0) {
         free(info);
         unix_error(errno, "safe_exec", Nothing);
@@ -283,8 +310,10 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
 
     caml_leave_blocking_section();
 
+    waiter = alloc_my_pidwaiter(pid);
+
     res = caml_alloc_small(2, 0);
-    Field(res, 0) = alloc_my_pidwaiter(pid);
+    Field(res, 0) = waiter;
     Field(res, 1) = Val_int(pid);
 
     CAMLreturn(res);
@@ -330,6 +359,8 @@ static int compare_wanted(const mapping *a, const mapping *b)
     return a->wanted_fd - b->wanted_fd;
 }
 
+static bool close_fds_from(int fd);
+
 static void close_unwanted(mapping *const mappings, unsigned num_mappings)
 {
     sort_mapping(mappings, num_mappings, compare_current);
@@ -341,7 +372,40 @@ static void close_unwanted(mapping *const mappings, unsigned num_mappings)
             close(fd);
         prev = m->current_fd;
     }
-    // TODO close from prev+1 to the top!
+    close_fds_from(prev + 1);
+}
+
+static bool close_fds_from(int fd_from)
+{
+#if defined(__linux__) && defined(SYS_close_range)
+    static bool close_range_supported = true;
+    if (close_range_supported) {
+        if (syscall(SYS_close_range, fd_from, ~0U, 0) == 0)
+            return true;
+
+        if (errno == ENOSYS)
+            close_range_supported = false;
+    }
+#endif
+
+    DIR *dir = opendir("/proc/self/fd");
+    if (dir) {
+        const int dir_fd = dirfd(dir);
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            char *end = NULL;
+            unsigned long fd = strtoul(ent->d_name, &end, 10);
+            if (end == NULL || *end)
+                continue;
+            if (fd >= fd_from && fd != dir_fd)
+                close(fd);
+        }
+        closedir(dir);
+        return true;
+    }
+
+    // TODO use just a loop
+    return false;
 }
 
 CAMLprim value
