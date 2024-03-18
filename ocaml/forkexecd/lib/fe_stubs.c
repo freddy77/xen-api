@@ -45,7 +45,7 @@ typedef struct {
 
 static void pidwaiter_finalize(value v)
 {
-  // TODO
+  // TODO reap the pid to avoid zombies
 }
 
 static struct custom_operations custom_ops = {
@@ -145,6 +145,9 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
     exec_info *info = (exec_info *) calloc(total_size, 1);
     if (!info)
         unix_error(ENOMEM, "safe_exec", Nothing);
+
+    caml_enter_blocking_section();
+
     char **ptrs = (char**)(info + 1);
     mapping *mappings = (mapping *) (ptrs + num_args + 1 + num_environment + 1);
     char *strings = (char*) (mappings + num_mappings);
@@ -187,8 +190,10 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
 #ifdef DEBUG
     if (strings - (char*)info != total_size
         || initial_mappings != (mapping*) ptrs
-        || initial_strings != (char*) mappings)
+        || initial_strings != (char*) mappings) {
+        caml_leave_blocking_section();
         unix_error(EACCES, "safe_exec", Nothing);
+    }
 #endif
 
 //    unix_error(ENOSYS, "safe_exec", Nothing);
@@ -266,6 +271,8 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
     }
     free(info);
 
+    caml_leave_blocking_section();
+
     res = caml_alloc_small(2, 0);
     Field(res, 0) = alloc_my_pidwaiter(); // TODO pidwaiter
     Field(res, 1) = Val_int(pid);
@@ -324,7 +331,7 @@ static void close_unwanted(mapping *const mappings, unsigned num_mappings)
             close(fd);
         prev = m->current_fd;
     }
-    // TODO close from prev+1 on the top!
+    // TODO close from prev+1 to the top!
 }
 
 CAMLprim value
