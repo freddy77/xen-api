@@ -102,14 +102,14 @@ let dontwaitpid_daemon sock _pid =
 let waitpid (waiter, pid) =
   match waiter with
   | Pidwaiter waiter ->
-     Fe_stubs.pidwaiter_waitpid waiter
+     Fe_stubs.pidwaiter_waitpid waiter pid
   | Sock sock ->
      waitpid_daemon sock pid
 
 let waitpid_nohang (waiter, pid) =
   match waiter with
   | Pidwaiter waiter ->
-     Fe_stubs.pidwaiter_waitpid_nohang waiter
+     Fe_stubs.pidwaiter_waitpid_nohang waiter pid
   | Sock sock ->
      waitpid_nohang_daemon sock pid
 
@@ -373,7 +373,12 @@ let execute_command_get_output_inner ?env ?stdin ?(syslog_stdout = NoSyslogging)
                   stdinandpipes ;
                 match waiter with
                 | Pidwaiter waiter ->
-                  Fe_stubs.pidwaiter_waitpid ~timeout:timeout waiter
+                  if timeout > 0. then
+                    (try Fe_stubs.pidwaiter_waitpid ~timeout:timeout waiter pid
+                    with Unix.(Unix_error (ETIMEDOUT, _, _)) ->
+                    raise Subprocess_timeout)
+                  else
+                    (Fe_stubs.pidwaiter_waitpid waiter pid)
                 | Sock sock ->
                   if timeout > 0. then
                     Unix.setsockopt_float sock Unix.SO_RCVTIMEO timeout ;

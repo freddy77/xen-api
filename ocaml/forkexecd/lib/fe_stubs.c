@@ -14,6 +14,10 @@
 
 #include <errno.h>
 #include <string.h>
+#include <stdbool.h>
+#include <math.h>
+#include <pthread.h>
+#include <sys/wait.h>
 
 #include <caml/alloc.h>
 #include <caml/mlvalues.h>
@@ -145,18 +149,32 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
     }
     *ptrs++ = NULL;
 
-    free(info);
-
 #ifdef DEBUG
     if (strings - (char*)info != total_size || initial_strings != (char*) ptrs)
         unix_error(EACCES, "safe_exec", Nothing);
 #endif
 
-    unix_error(ENOSYS, "safe_exec", Nothing);
+//    unix_error(ENOSYS, "safe_exec", Nothing);
+
+    // rename all command line
+    // fork
+    pid_t pid = fork();
+    if (pid < 0) {
+        free(info);
+        unix_error(errno, "safe_exec", Nothing);
+    }
+
+    if (pid == 0) {
+        // child
+        // TODO adjust file descriptors
+        execve(info->args[0], info->args, info->environment);
+        exit(errno == ENOENT ? 127 : 126);
+    }
+    free(info);
 
     res = caml_alloc_small(2, 0);
     Field(res, 0) = alloc_my_pidwaiter(); // TODO pidwaiter
-    Field(res, 1) = Val_int(123); // TODO pid
+    Field(res, 1) = Val_int(pid);
 
     CAMLreturn(res);
 }
@@ -171,16 +189,66 @@ caml_pidwaiter_dontwait(value waiter)
     CAMLreturn(Val_unit);
 }
 
-CAMLprim value
-caml_pidwaiter_waitpid(value timeout_, value waiter)
+typedef struct {
+    pid_t pid;
+    bool timed_out;
+    struct timespec ts;
+    pthread_mutex_t mtx;
+    pthread_cond_t cond;
+} timeout_kill;
+
+static void *proc_timeout_kill(void *arg)
 {
-    CAMLparam2(timeout_, waiter);
+    timeout_kill *tm = (timeout_kill *) arg;
+    pthread_mutex_lock(&tm->mtx);
+    int res  = pthread_cond_timedwait(&tm->cond, &tm->mtx, &tm->ts);
+    pthread_mutex_unlock(&tm->mtx);
+
+    if (res == ETIMEDOUT) {
+        kill(tm->pid, SIGKILL);
+        tm->timed_out = true;
+    }
+}
+
+CAMLprim value
+caml_pidwaiter_waitpid(value timeout_, value pid_)
+{
+    CAMLparam2(timeout_, pid_);
     double timeout = timeout_ == Val_none ? 0 : Double_val(Some_val(timeout_));
+    pid_t const pid = Int_val(pid_);
 
-    unix_error(ENOSYS, "xxx", Nothing);
+    // TODO handle errors
+    timeout_kill tm = { pid, false };
+    clock_gettime(CLOCK_MONOTONIC, &tm.ts);
 
-    // TODO type
-    CAMLreturn(Val_unit);
+    if (timeout > 0) {
+        // TODO if no timeout just use a wait !!
+        double f = floor(timeout);
+        tm.ts.tv_sec += f;
+        tm.ts.tv_nsec += (timeout - f) * 1000000000.;
+    }
+
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+
+    pthread_cond_init(&tm.cond, &attr);
+    pthread_condattr_destroy(&attr);
+
+    pthread_mutex_init(&tm.mtx, NULL);
+
+    pthread_t th;
+    pthread_create(&th, NULL, proc_timeout_kill, &tm);
+    siginfo_t info;
+    waitid(P_PID, pid, &info, WEXITED|WNOWAIT);
+    pthread_mutex_lock(&tm.mtx);
+    pthread_cond_broadcast(&tm.cond);
+    pthread_mutex_unlock(&tm.mtx);
+    pthread_join(th, NULL);
+    pthread_cond_destroy(&tm.cond);
+    pthread_mutex_destroy(&tm.mtx);
+
+    CAMLreturn(tm.timed_out ? Val_true : Val_false);
 }
 
 CAMLprim value
@@ -193,3 +261,12 @@ caml_pidwaiter_waitpid_nohang(value waiter)
     // TODO type
     CAMLreturn(Val_unit);
 }
+
+/*
+ * waiter : proc thread with small thread
+ *    pthread_cond_timedwait (cond, time + XXX)
+ *    if (timeout) kill(pid, SIGKILL)
+ * reaper : proc thread with small thread, detached
+ *    waitpid (pid)
+ *
+ */
