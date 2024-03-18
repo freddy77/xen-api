@@ -16,7 +16,9 @@ SOCKET=${XDG_RUNTIME_DIR}/xapi/forker/main
 rm -f "$SOCKET"
 killall fe_main.exe > /dev/null 2>&1
 
-strace -f -o trace -s 800 ../src/fe_main.exe &
+ulimit -c unlimited
+# strace -f -o trace -s 800 ../src/fe_main.exe &
+../src/fe_main.exe &
 MAIN=$!
 cleanup () {
     killall fe_main.exe > /dev/null 2>&1
@@ -26,4 +28,6 @@ trap cleanup EXIT INT
 for _ in $(seq 1 10); do
     test -S ${SOCKET} || sleep 1
 done
+#echo "" | strace -tt -f -b execve -s 200 -o trace ./fe_test.exe 16
+#echo "" | strace -tt -f -s 200 -o trace ./fe_test.exe 16
 echo "" | ./fe_test.exe 16
