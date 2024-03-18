@@ -27,17 +27,11 @@ let pidwaiter_waitpid ?timeout _waiter pid = (* -> int * Unix.process_status = *
        let timed_out = pidwaiter_waitpid0 ~timeout:timeout pid in
        (* TODO timeout *)
        let (pid, status) = Unix.waitpid [] pid in
-       if not timed_out then
+       (match timed_out, status with
+       | true, Unix.WSIGNALED n when n = Sys.sigkill ->
+           raise (Unix.Unix_error(Unix.ETIMEDOUT, "waitpid", ""))
+       | _ ->
           (pid, status)
-       else (
-         match status with
-         | Unix.WSIGNALED n ->
-           if n = Sys.sigkill then
-             raise (Unix.Unix_error(Unix.ETIMEDOUT, "waitpid", ""))
-           else
-             (pid, status)
-         | _ ->
-           (pid, status)
        )
    | None ->
        (* TODO set reap *)
