@@ -21,8 +21,6 @@ external pidwaiter_dontwait : pidwaiter -> unit = "caml_pidwaiter_dontwait"
 (* timeout <= 0 wait infinite *)
 external pidwaiter_waitpid0 : ?timeout:float -> int -> bool = "caml_pidwaiter_waitpid"
 
-external pidwaiter_waitpid_nohang0 : pidwaiter -> int * Unix.process_status = "caml_pidwaiter_waitpid_nohang"
-
 let pidwaiter_waitpid ?timeout _waiter pid = (* -> int * Unix.process_status = *)
    match timeout with
    | Some timeout ->

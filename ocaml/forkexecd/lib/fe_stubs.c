@@ -254,17 +254,6 @@ caml_pidwaiter_waitpid(value timeout_, value pid_)
     CAMLreturn(timed_out ? Val_true : Val_false);
 }
 
-CAMLprim value
-caml_pidwaiter_waitpid_nohang(value waiter)
-{
-    CAMLparam1(waiter);
-
-    unix_error(ENOSYS, "xxx", Nothing);
-
-    // TODO type
-    CAMLreturn(Val_unit);
-}
-
 /*
  * waiter : proc thread with small thread
  *    pthread_cond_timedwait (cond, time + XXX)
