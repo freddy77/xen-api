@@ -22,6 +22,7 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -128,7 +129,7 @@ static inline void sort_mapping(mapping *const mappings, unsigned num_mappings,
 
 static void adjust_args(char **args, mapping *const mappings, unsigned num_mappings);
 static bool fd_is_used(const mapping *const mappings, unsigned num_mappings, int fd);
-static void close_unwanted(mapping *const mappings, unsigned num_mappings);
+static void close_unwanted_fds(mapping *const mappings, unsigned num_mappings);
 static int compare_current(const mapping *a, const mapping *b);
 static int compare_wanted(const mapping *a, const mapping *b);
 
@@ -251,7 +252,9 @@ caml_safe_exec(value args, value environment, value id_mapping, value syslog_fla
         printf("\n");
 #endif
 
-        close_unwanted(info->mappings, num_mappings);
+        // close earlier to have space for the redirections in case we are using a lot of file
+        //descriptors
+        close_unwanted_fds(info->mappings, num_mappings);
 
         if (setsid() < 0)
             _exit(1);
@@ -361,7 +364,7 @@ static int compare_wanted(const mapping *a, const mapping *b)
 
 static bool close_fds_from(int fd);
 
-static void close_unwanted(mapping *const mappings, unsigned num_mappings)
+static void close_unwanted_fds(mapping *const mappings, unsigned num_mappings)
 {
     sort_mapping(mappings, num_mappings, compare_current);
 
@@ -377,10 +380,16 @@ static void close_unwanted(mapping *const mappings, unsigned num_mappings)
 
 static bool close_fds_from(int fd_from)
 {
-#if defined(__linux__) && defined(SYS_close_range)
+    // first method, use close_range
+#if (defined(__linux__) && defined(SYS_close_range)) \
+    || (defined(__FreeBSD__) && defined(CLOSE_RANGE_CLOEXEC))
     static bool close_range_supported = true;
     if (close_range_supported) {
+#if defined(__linux__)
         if (syscall(SYS_close_range, fd_from, ~0U, 0) == 0)
+#else
+        if (close_range(fd_from, ~0U, 0) == 0)
+#endif
             return true;
 
         if (errno == ENOSYS)
@@ -388,6 +397,7 @@ static bool close_fds_from(int fd_from)
     }
 #endif
 
+    // second method, read fds list from /proc
     DIR *dir = opendir("/proc/self/fd");
     if (dir) {
         const int dir_fd = dirfd(dir);
@@ -404,8 +414,14 @@ static bool close_fds_from(int fd_from)
         return true;
     }
 
-    // TODO use just a loop
-    return false;
+    // third method, use just a loop
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) < 0)
+        return false;
+    for (int fd = fd_from; fd < limit.rlim_cur; ++ fd)
+        close(fd);
+
+    return true;
 }
 
 CAMLprim value
