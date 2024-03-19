@@ -470,7 +470,7 @@ create_thread_minstack(pthread_t *th, void *(*proc)(void *), void *arg)
     // for the thread
     sigset_t sigset, old_sigset;
     sigfillset(&sigset);
-    sigprocmask(SIG_SETMASK, &sigset, &old_sigset);
+    sigprocmask(SIG_BLOCK, &sigset, &old_sigset);
 
     pthread_attr_t th_attr;
     res = pthread_attr_init(&th_attr);
