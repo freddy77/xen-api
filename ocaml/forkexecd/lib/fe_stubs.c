@@ -48,7 +48,12 @@
 static int create_thread_minstack(pthread_t *th, void *(*proc)(void *), void *arg);
 
 typedef struct {
+    // pid of the process we wait, never changed
     pid_t pid;
+
+    pthread_mutex_t mtx;
+
+    // if pid was reaped, we need to reap only once
     bool reaped;
 } pidwaiter;
 
@@ -69,10 +74,14 @@ static void pidwaiter_finalize(value v)
 {
     PIDWAITER(waiter, v);
 
+    pid_t pid = waiter->pid;
+    bool reaped = waiter->reaped;
+    pthread_mutex_destroy(&waiter->mtx);
+
     // reap the pid to avoid zombies
-    if (!waiter->reaped) {
+    if (!reaped) {
         pthread_t th;
-        create_thread_minstack(&th, proc_reap, (void *) (intptr_t) waiter->pid);
+        create_thread_minstack(&th, proc_reap, (void *) (intptr_t) pid);
         pthread_detach(th);
     }
 }
@@ -93,6 +102,7 @@ static value alloc_my_pidwaiter(pid_t pid)
     value v = caml_alloc_custom(&custom_ops, sizeof(pidwaiter), 0, 1);
     PIDWAITER(waiter, v);
     waiter->pid = pid;
+    pthread_mutex_init(&waiter->mtx, NULL);
     waiter->reaped = false;
     return v;
 }
@@ -430,9 +440,16 @@ caml_pidwaiter_dontwait(value waiter_val)
     CAMLparam1(waiter_val);
     PIDWAITER(waiter, waiter_val);
 
-    if (!waiter->reaped) {
-        // TODO we need to wait the pid
-        unix_error(ENOSYS, "xxx", Nothing);
+    pthread_mutex_lock(&waiter->mtx);
+    bool reaped = waiter->reaped;
+    waiter->reaped = true;
+    pthread_mutex_unlock(&waiter->mtx);
+
+    // reap the pid to avoid zombies
+    if (!reaped) {
+        pthread_t th;
+        create_thread_minstack(&th, proc_reap, (void *) (intptr_t) waiter->pid);
+        pthread_detach(th);
     }
 
     CAMLreturn(Val_unit);
@@ -551,6 +568,14 @@ caml_pidwaiter_waitpid(value timeout_value, value waiter_value)
     double timeout = timeout_value == Val_none ? 0 : Double_val(Some_val(timeout_value));
     pid_t const pid = waiter->pid;
 
+    pthread_mutex_lock(&waiter->mtx);
+    bool reaped = waiter->reaped;
+    pthread_mutex_unlock(&waiter->mtx);
+
+    // already reaped, we cannot wait more
+    if (reaped)
+        unix_error(EINVAL, "pidwaiter_waitpid", Nothing);
+
     caml_enter_blocking_section();
 
     bool timed_out = false;
@@ -581,19 +606,11 @@ caml_pidwaiter_set_reap(value waiter_value)
     CAMLparam1(waiter_value);
     PIDWAITER(waiter, waiter_value);
 
+    pthread_mutex_lock(&waiter->mtx);
     waiter->reaped = true;
+    pthread_mutex_unlock(&waiter->mtx);
 
     CAMLreturn(Val_unit);
 }
-
-
-/*
- * waiter : proc thread with small thread
- *    pthread_cond_timedwait (cond, time + XXX)
- *    if (timeout) kill(pid, SIGKILL)
- * reaper : proc thread with small thread, detached
- *    waitpid (pid)
- *
- */
 
 // vim: expandtab ts=4 sw=4 sts=4:
