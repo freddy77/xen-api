@@ -1,0 +1,13 @@
+(executable
+ (modes exe)
+ (name fe_test_speed)
+ (public_name fe_test_speed)
+ (package xapi-debug)
+ (libraries forkexec threads.posix))
+
+(rule
+ (alias runtest)
+ (package xapi-forkexecd)
+ (deps fe_test.sh fe_test_speed.exe ../src/fe_main.exe ../test/syslog.so ../helper/vfork_helper)
+ (action
+  (run ./fe_test.sh)))
