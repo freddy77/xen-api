@@ -141,3 +141,5 @@ val with_logfile_fd :
 
 val temp_dir_server : string
 (** Temporary directory used for communication *)
+
+val use_daemon : bool ref
